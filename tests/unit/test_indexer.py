@@ -10,6 +10,7 @@ from dns_aid.core.indexer import (
     INDEX_RECORD_NAME,
     IndexEntry,
     IndexResult,
+    _parse_params_from_svcb_values,
     delete_index,
     format_index_txt,
     parse_index_txt,
@@ -590,6 +591,107 @@ class TestSyncIndex:
 
         assert result.success is True
         assert result.entries == []
+
+
+class TestParseParamsFromSvcbValues:
+    """Unit tests for the _parse_params_from_svcb_values helper."""
+
+    def test_alpn_quoted(self):
+        assert _parse_params_from_svcb_values(['1 x. alpn="mcp"']) == {"alpn": "mcp"}
+
+    def test_key65402_quoted(self):
+        assert _parse_params_from_svcb_values(['1 x. key65402="mcp"']) == {"bap": "mcp"}
+
+    def test_alpn_unquoted(self):
+        assert _parse_params_from_svcb_values(["1 x. alpn=a2a"]) == {"alpn": "a2a"}
+
+    def test_empty_values(self):
+        assert _parse_params_from_svcb_values([]) == {}
+
+    def test_multiple_params(self):
+        result = _parse_params_from_svcb_values(['1 x. alpn="mcp" port="443"'])
+        assert result.get("alpn") == "mcp"
+
+    def test_invalid_rdata_skipped(self):
+        assert _parse_params_from_svcb_values(["not valid \" rdata"]) == {}
+
+
+class _StubRealBackend:
+    """Minimal stub that produces values-format SVCB records like real backends.
+
+    Emits two SVCB records per agent:
+    - 'chat'         — the flat primary with protocol params in ``values``
+    - 'chat._agents' — the walkable AliasMode pointer (no params)
+    sync_index matches 'chat._agents' via the walkable pattern, then resolves
+    the protocol from primary_records['chat'] — that's the path the fix covers.
+    """
+
+    def __init__(self, svcb_values_str, protocol="mcp"):
+        self._svcb_values_str = svcb_values_str
+        self._protocol = protocol
+        self.written = []
+
+    async def zone_exists(self, zone):
+        return True
+
+    async def list_records(self, zone, record_type, name_pattern=None):
+        if record_type == "SVCB":
+            # Primary record: flat-FQDN owner carrying the protocol SvcParam
+            yield {
+                "name": "chat",
+                "fqdn": f"chat.{zone}",
+                "type": "SVCB",
+                "ttl": 3600,
+                "values": [self._svcb_values_str],
+                "data": {},
+            }
+            # Walkable AliasMode pointer — no protocol params here
+            yield {
+                "name": "chat._agents",
+                "fqdn": f"chat._agents.{zone}",
+                "type": "SVCB",
+                "ttl": 3600,
+                "values": [f"0 chat.{zone}."],
+                "data": {},
+            }
+        elif record_type == "TXT":
+            if name_pattern is None or name_pattern == INDEX_RECORD_NAME:
+                yield {
+                    "name": INDEX_RECORD_NAME,
+                    "fqdn": f"{INDEX_RECORD_NAME}.{zone}",
+                    "type": "TXT",
+                    "ttl": 3600,
+                    "values": [f"agents=chat:{self._protocol}"],
+                }
+
+    async def create_txt_record(self, **kwargs):
+        self.written.append(kwargs)
+
+    async def list_zones(self):
+        return []
+
+
+@pytest.mark.asyncio
+class TestSyncIndexRealBackendFormat:
+    """Regression tests: sync_index correctly reads protocol from real-backend values strings."""
+
+    async def test_alpn_quoted_route53_cloudflare_format(self):
+        backend = _StubRealBackend('1 chat.example.com. alpn="mcp"')
+        result = await sync_index("example.com", backend)
+        assert result.success is True
+        assert result.entries == [IndexEntry(name="chat", protocol="mcp")]
+
+    async def test_key65402_akamai_format(self):
+        backend = _StubRealBackend('1 chat.example.com. key65402="mcp"')
+        result = await sync_index("example.com", backend)
+        assert result.success is True
+        assert result.entries == [IndexEntry(name="chat", protocol="mcp")]
+
+    async def test_alpn_unquoted_infoblox_format(self):
+        backend = _StubRealBackend("1 chat.example.com. alpn=a2a", protocol="a2a")
+        result = await sync_index("example.com", backend)
+        assert result.success is True
+        assert result.entries == [IndexEntry(name="chat", protocol="a2a")]
 
 
 class TestIndexResult:

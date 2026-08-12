@@ -363,6 +363,36 @@ async def delete_index(
         return False
 
 
+def _parse_params_from_svcb_values(values: list[str]) -> dict[str, str]:
+    """Extract SvcParam key→value pairs from SVCB rdata presentation strings.
+
+    Real backends (Route53, Cloudflare, Akamai, Infoblox) emit values like:
+        '1 chat.example.com. alpn="mcp" port="443"'
+        '1 chat.example.com. key65402="mcp/1"'
+    Tokenise with shlex (which strips surrounding quotes), skip the leading
+    priority+target tokens, and map keyNNNNN numeric IDs back to their
+    string names via DNS_AID_KEY_MAP_REVERSE.
+    """
+    import shlex
+
+    from dns_aid.core.models import DNS_AID_KEY_MAP_REVERSE
+
+    result: dict[str, str] = {}
+    for rdata in values:
+        try:
+            tokens = shlex.split(rdata)
+        except ValueError:
+            continue
+        for token in tokens[2:]:  # skip priority and target
+            if "=" not in token:
+                continue
+            k, _, v = token.partition("=")
+            canonical = DNS_AID_KEY_MAP_REVERSE.get(k, k)
+            if v:
+                result[canonical] = v
+    return result
+
+
 async def sync_index(
     domain: str,
     backend: DNSBackend,
@@ -421,6 +451,8 @@ async def sync_index(
         if not primary:
             return UNKNOWN_PROTOCOL
         params = primary.get("data", {}).get("params", {}) or {}
+        if not (params.get("bap") or params.get("alpn")):
+            params = _parse_params_from_svcb_values(primary.get("values") or [])
         # SVCB params from list_records may carry stray quoting.
         raw = params.get("bap") or params.get("alpn")
         if not raw:
